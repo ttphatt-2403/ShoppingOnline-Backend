@@ -1,0 +1,262 @@
+# 🔄 **CI/CD PIPELINE - GitHub Actions**
+
+name: Deploy ShoppingOnline to Cloud
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # 🧪 Testing Stage
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '8.0.x'
+    
+    - name: Restore dependencies
+      run: dotnet restore ShoppingOnline.API/ShoppingOnline.API.csproj
+    
+    - name: Build
+      run: dotnet build ShoppingOnline.API/ShoppingOnline.API.csproj --no-restore
+    
+    - name: Run Unit Tests
+      run: dotnet test --no-build --verbosity normal
+    
+    - name: Run Integration Tests
+      run: |
+        docker-compose -f docker-compose.test.yml up -d
+        sleep 30
+        dotnet test Tests/IntegrationTests --no-build --verbosity normal
+        docker-compose -f docker-compose.test.yml down
+
+  # 🏗️ Build & Push Docker Image
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: ./ShoppingOnline.API
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # ☁️ Deploy to Staging
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Deploy to Azure Container Apps (Staging)
+      uses: azure/container-apps-deploy-action@v1
+      with:
+        acrName: ${{ secrets.AZURE_REGISTRY_NAME }}
+        containerAppName: shoppingonline-staging
+        resourceGroup: ${{ secrets.AZURE_RG }}
+        imageToDeploy: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        environmentVariables: |
+          ASPNETCORE_ENVIRONMENT=Staging
+          ConnectionStrings__DefaultConnection=${{ secrets.STAGING_DB_CONNECTION }}
+          JWT__SecretKey=${{ secrets.JWT_SECRET }}
+
+    - name: Run Smoke Tests
+      run: |
+        # Wait for deployment
+        sleep 60
+        
+        # Health check
+        curl -f https://shoppingonline-staging.azurecontainerapps.io/health
+        
+        # API test
+        curl -f https://shoppingonline-staging.azurecontainerapps.io/api/products
+
+  # 🚀 Deploy to Production
+  deploy-production:
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Kubectl
+      uses: azure/setup-kubectl@v3
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Get AKS Credentials
+      run: |
+        az aks get-credentials --resource-group ${{ secrets.AZURE_RG }} --name ${{ secrets.AKS_CLUSTER_NAME }}
+
+    - name: Deploy to Kubernetes
+      run: |
+        # Update image tag in deployment
+        sed -i 's|image: .*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest|' k8s/deployment.yaml
+        
+        # Apply manifests
+        kubectl apply -f k8s/
+        
+        # Wait for rollout
+        kubectl rollout status deployment/shoppingonline-api -n shopping-online --timeout=300s
+
+    - name: Verify Deployment
+      run: |
+        # Check pods
+        kubectl get pods -n shopping-online
+        
+        # Check service
+        kubectl get service -n shopping-online
+        
+        # Health check
+        sleep 30
+        curl -f https://yourdomain.com/health
+
+  # 📊 Performance Testing
+  performance-test:
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - name: Run Load Test
+      uses: grafana/k6-action@v0.3.0
+      with:
+        filename: tests/load-test.js
+      env:
+        BASE_URL: https://yourdomain.com
+
+    - name: Upload Performance Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-report
+        path: performance-report.html
+
+# 📈 **Load Test Script (k6)**
+---
+# tests/load-test.js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export let options = {
+  stages: [
+    { duration: '2m', target: 100 }, // Ramp up
+    { duration: '5m', target: 100 }, // Stay at 100 users
+    { duration: '2m', target: 200 }, // Ramp up to 200
+    { duration: '5m', target: 200 }, // Stay at 200
+    { duration: '2m', target: 500 }, // Ramp up to 500
+    { duration: '5m', target: 500 }, // Stay at 500
+    { duration: '2m', target: 0 },   // Ramp down
+  ],
+  thresholds: {
+    http_req_duration: ['p(95)<500'], // 95% of requests should be below 500ms
+    http_req_failed: ['rate<0.1'],    // Error rate should be less than 10%
+  },
+};
+
+export default function () {
+  // Test API endpoints
+  let response = http.get(`${__ENV.BASE_URL}/api/products`);
+  check(response, {
+    'status is 200': (r) => r.status === 200,
+    'response time < 500ms': (r) => r.timings.duration < 500,
+  });
+
+  sleep(1);
+
+  // Test authentication
+  let loginData = {
+    email: 'test@example.com',
+    password: 'Test123!',
+  };
+  
+  let loginResponse = http.post(
+    `${__ENV.BASE_URL}/api/users/login`,
+    JSON.stringify(loginData),
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+  
+  check(loginResponse, {
+    'login successful': (r) => r.status === 200,
+  });
+
+  sleep(1);
+}
+
+# 🔐 **Security Scanning**
+---
+# .github/workflows/security.yml
+name: Security Scan
+
+on:
+  schedule:
+    - cron: '0 2 * * 1' # Weekly on Monday
+  push:
+    branches: [ main ]
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: OWASP ZAP Baseline Scan
+      uses: zaproxy/action-baseline@v0.7.0
+      with:
+        target: 'https://yourdomain.com'
