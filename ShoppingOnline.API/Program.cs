@@ -148,14 +148,16 @@ namespace ShoppingOnline.API
                 }
             }
 
-            // Configure the HTTP request pipeline.
-            if (app.Environment.IsDevelopment())
-            {
-                app.UseSwagger();
-                app.UseSwaggerUI();
-            }
+                // Configure the HTTP request pipeline.
+                if (app.Environment.IsDevelopment())
+                {
+                    app.UseSwagger();
+                    app.UseSwaggerUI();
+                }
 
-            app.UseHttpsRedirection();
+                // Enable static files (for images, etc.)
+                app.UseStaticFiles();
+                app.UseHttpsRedirection();
 
             // Enable CORS - MUST be before Authentication
             if (app.Environment.IsDevelopment())
