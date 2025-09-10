@@ -115,7 +115,7 @@ jobs:
       if: github.event_name != 'pull_request'
       uses: docker/login-action@v3
       with:
-        username: ${{ secrets.TTPHATT2403 }}
+        username: ttphatt2403
         password: ${{ secrets.DOCKER_PASSWORD }}
         
     # Bước 4: Build Docker image
